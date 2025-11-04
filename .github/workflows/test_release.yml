@@ -171,7 +171,7 @@ jobs:
       - name: 安装构建依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -yq --no-install-recommends ccache python3 git curl time libssl-dev flex bison
+          sudo apt-get install -yq --no-install-recommends ccache python3 git curl time libssl-dev flex
       - name: 配置ccache
         run: |
           set -euo pipefail
@@ -332,140 +332,120 @@ jobs:
           cd ./common
           patch -p1 --fuzz=3 < 50_add_susfs_in_gki-${{ env.SELECTED_ANDROID_VERSION }}-${{ env.SELECTED_KERNEL_VERSION }}.patch || { echo "::error::SUSFS common patch failed."; exit 1; }
           cd - >/dev/null
-
-      - name: 安全应用内核补丁
+      - name: 应用内核补丁
         shell: bash
         run: |
           set -euo pipefail
           COMMON_DIR_PATH="${{ env.KERNEL_SRC_ROOT }}/common"
           
-          # 检查补丁文件是否存在并备份原始文件
-          check_and_backup() {
-            local patch_file="$1"
-            local patch_name="$2"
-            
-            if [ ! -f "$patch_file" ]; then
-              echo "::warning::补丁文件不存在: $patch_file，跳过"
-              return 1
+          apply_hooks_patch() {
+            cd "$COMMON_DIR_PATH" || return 1
+            HOOKS_PATCH_FILE="${GITHUB_WORKSPACE}/SukiSU_patch/hooks/syscall_hooks.patch"
+            if [ -f "$HOOKS_PATCH_FILE" ]; then
+              cp "$HOOKS_PATCH_FILE" ./syscall_hooks.patch
+              if ! patch -p1 -F 3 < syscall_hooks.patch; then
+                echo "::error::SukiSU hooks patch failed."
+                return 1
+              fi
             fi
-            
-            # 创建备份
-            cd "$COMMON_DIR_PATH"
-            if [ ! -d ".patch_backup" ]; then
-              mkdir .patch_backup
-            fi
-            
             return 0
           }
           
-          apply_patch_with_fallback() {
-            local patch_file="$1"
-            local patch_name="$2"
-            local max_fuzz="${3:-3}"
-            
-            if ! check_and_backup "$patch_file" "$patch_name"; then
-              return 1
+          apply_zram_compression_patches() {
+            if [[ "${{ github.event.inputs.use_zram }}" == "true" ]]; then
+              cd "$COMMON_DIR_PATH" || return 1
+              ZRAM_PATCH_BASE="${GITHUB_WORKSPACE}/SukiSU_patch/other/zram"
+              
+              # 复制lz4k include文件
+              src_inc="${ZRAM_PATCH_BASE}/lz4k/include/linux"
+              dst_inc="./include/linux"
+              if [ -d "$src_inc" ]; then
+                mkdir -p "$dst_inc"
+                if [ -n "$(ls -A "$src_inc" 2>/dev/null)" ]; then
+                  cp -r "${src_inc}/." "$dst_inc/" || return 1
+                fi
+              fi
+              
+              # 复制lz4k lib文件
+              src_lib="${ZRAM_PATCH_BASE}/lz4k/lib"
+              dst_lib="./lib"
+              if [ -d "$src_lib" ]; then
+                mkdir -p "$dst_lib"
+                if [ -n "$(ls -A "$src_lib" 2>/dev/null)" ]; then
+                  cp -r "${src_lib}/." "$dst_lib/" || return 1
+                fi
+              fi
+              
+              # 复制lz4k crypto文件
+              src_crypto="${ZRAM_PATCH_BASE}/lz4k/crypto"
+              dst_crypto="./crypto"
+              if [ -d "$src_crypto" ]; then
+                mkdir -p "$dst_crypto"
+                if [ -n "$(ls -A "$src_crypto" 2>/dev/null)" ]; then
+                  cp -r "${src_crypto}/." "$dst_crypto/" || return 1
+                else
+                  return 1
+                fi
+              else
+                return 1
+              fi
+              
+              # 复制lz4k_oplus
+              if [ -d "${ZRAM_PATCH_BASE}/lz4k_oplus" ]; then
+                mkdir -p ./lib
+                cp -r "${ZRAM_PATCH_BASE}/lz4k_oplus" ./lib/ || return 1
+              fi
+              
+              # 应用lz4kd补丁
+              LZ4KD_PATCH="${ZRAM_PATCH_BASE}/zram_patch/${{env.SELECTED_KERNEL_VERSION}}/lz4kd.patch"
+              if [ -f "$LZ4KD_PATCH" ]; then
+                cp "$LZ4KD_PATCH" ./lz4kd.patch
+                if ! patch -p1 -F 3 < lz4kd.patch; then
+                  return 1
+                fi
+              fi
+              
+              # 应用lz4k_oplus补丁
+              LZ4KOPLUS_PATCH="${ZRAM_PATCH_BASE}/zram_patch/${{env.SELECTED_KERNEL_VERSION}}/lz4k_oplus.patch"
+              if [ -f "$LZ4KOPLUS_PATCH" ]; then
+                cp "$LZ4KOPLUS_PATCH" ./lz4k_oplus.patch
+                if ! patch -p1 -F 3 < lz4k_oplus.patch; then
+                  return 1
+                fi
+              fi
             fi
-            
-            cd "$COMMON_DIR_PATH"
-            echo "应用补丁: $patch_name (fuzz=$max_fuzz)"
-            
-            # 尝试应用补丁
-            if patch -p1 --fuzz=$max_fuzz --forward < "$patch_file"; then
-              echo "✅ 补丁应用成功: $patch_name"
-              return 0
-            else
-              echo "::warning::补丁应用失败: $patch_name (fuzz=$max_fuzz)，尝试跳过"
-              # 尝试恢复
-              patch -p1 --fuzz=$max_fuzz --reverse < "$patch_file" 2>/dev/null || true
-              return 1
-            fi
+            return 0
           }
           
-          # 应用hooks补丁
-          HOOKS_PATCH_FILE="${GITHUB_WORKSPACE}/SukiSU_patch/hooks/syscall_hooks.patch"
-          apply_patch_with_fallback "$HOOKS_PATCH_FILE" "SukiSU hooks" 5
-          
-          # 应用hide补丁  
-          HIDE_PATCH_FILE="${GITHUB_WORKSPACE}/SukiSU_patch/69_hide_stuff.patch"
-          apply_patch_with_fallback "$HIDE_PATCH_FILE" "Hide stuff" 5
-          
-          # ZRAM补丁只在启用时应用
-          if [[ "${{ github.event.inputs.use_zram }}" == "true" ]]; then
-            echo "应用ZRAM压缩补丁..."
-            cd "$COMMON_DIR_PATH"||exit 1
-            ZRAM_PATCH_BASE="${GITHUB_WORKSPACE}/SukiSU_patch/other/zram"
-            
-            # 复制文件
-            local src_inc="${ZRAM_PATCH_BASE}/lz4k/include/linux"; local dst_inc="./include/linux"
-            if [ -d "$src_inc" ]; then mkdir -p "$dst_inc"; if [ -n "$(ls -A "$src_inc" 2>/dev/null)" ]; then cp -r "${src_inc}/." "$dst_inc/" || echo "::warning::复制头文件失败"; fi; fi
-            
-            local src_lib="${ZRAM_PATCH_BASE}/lz4k/lib"; local dst_lib="./lib"
-            if [ -d "$src_lib" ]; then mkdir -p "$dst_lib"; if [ -n "$(ls -A "$src_lib" 2>/dev/null)" ]; then cp -r "${src_lib}/." "$dst_lib/" || echo "::warning::复制库文件失败"; fi; fi
-            
-            local src_crypto="${ZRAM_PATCH_BASE}/lz4k/crypto"; local dst_crypto="./crypto"
-            if [ -d "$src_crypto" ]; then mkdir -p "$dst_crypto"; if [ -n "$(ls -A "$src_crypto" 2>/dev/null)" ]; then cp -r "${src_crypto}/." "$dst_crypto/" || echo "::warning::复制加密模块失败"; fi; fi
-            
-            if [ -d "${ZRAM_PATCH_BASE}/lz4k_oplus" ]; then mkdir -p ./lib; cp -r "${ZRAM_PATCH_BASE}/lz4k_oplus" ./lib/ || echo "::warning::复制oplus补丁失败"; fi
-            
-            # 应用ZRAM相关补丁
-            LZ4KD_PATCH="${ZRAM_PATCH_BASE}/zram_patch/${{env.SELECTED_KERNEL_VERSION}}/lz4kd.patch"
-            if [ -f "$LZ4KD_PATCH" ]; then 
-              cp "$LZ4KD_PATCH" ./lz4kd.patch
-              apply_patch_with_fallback "./lz4kd.patch" "lz4kd" 5
+          apply_hide_stuff_patch() {
+            cd "$COMMON_DIR_PATH" || return 1
+            HIDE_PATCH_FILE="${GITHUB_WORKSPACE}/SukiSU_patch/69_hide_stuff.patch"
+            if [ -f "$HIDE_PATCH_FILE" ]; then
+              cp "$HIDE_PATCH_FILE" ./hide_stuff.patch
+              if ! patch -p1 -F 3 < hide_stuff.patch; then
+                echo "::error::Hide stuff patch failed."
+                return 1
+              fi
             fi
-            
-            LZ4KOPLUS_PATCH="${ZRAM_PATCH_BASE}/zram_patch/${{env.SELECTED_KERNEL_VERSION}}/lz4k_oplus.patch"
-            if [ -f "$LZ4KOPLUS_PATCH" ]; then 
-              cp "$LZ4KOPLUS_PATCH" ./lz4k_oplus.patch
-              apply_patch_with_fallback "./lz4k_oplus.patch" "lz4k_oplus" 5
-            fi
+            return 0
+          }
+          
+          # 并行执行补丁应用
+          apply_hooks_patch & PID_HOOKS=$!
+          apply_zram_compression_patches & PID_ZRAM=$!
+          apply_hide_stuff_patch & PID_HIDE=$!
+          
+          # 等待所有进程完成并检查退出状态
+          FAIL=0
+          wait $PID_HOOKS || { echo "::error::Hooks patch failed"; FAIL=1; }
+          wait $PID_ZRAM || { echo "::error::ZRAM patch failed"; FAIL=1; }
+          wait $PID_HIDE || { echo "::error::Hide stuff patch failed"; FAIL=1; }
+          
+          if [ "$FAIL" -eq 1 ]; then
+            exit 1
           fi
           
-          echo "所有补丁处理完成"
-
-      - name: 深度验证内核配置兼容性
-        run: |
-          set -euo pipefail
-          GKI_PATH="${{ env.GKI_DEFCONFIG_PATH_ENV }}"
-          
-          echo "=== 检查关键配置兼容性 ==="
-          
-          # 检查KernelSU和SUSFS的必要依赖
-          required_configs=(
-            "CONFIG_KPROBES"
-            "CONFIG_HAVE_KPROBES"
-            "CONFIG_KALLSYMS"
-            "CONFIG_MODULES"
-          )
-          
-          for config in "${required_configs[@]}"; do
-            if ! grep -q "^${config}=y" "$GKI_PATH"; then
-              echo "::warning::可能缺少必要配置: $config"
-            fi
-          done
-          
-          # 检查冲突配置
-          conflict_configs=(
-            "CONFIG_SECURITY_SELINUX"
-            "CONFIG_SECURITY_APPARMOR" 
-          )
-          
-          for config in "${conflict_configs[@]}"; do
-            if grep -q "^${config}=y" "$GKI_PATH"; then
-              echo "::warning::可能存在冲突配置: $config，尝试禁用"
-              sed -i "/^${config}=/d" "$GKI_PATH"
-              echo "# ${config} is not set" >> "$GKI_PATH"
-            fi
-          done
-          
-          # 确保模块支持开启
-          sed -i '/^CONFIG_MODULES=/d' "$GKI_PATH"
-          echo "CONFIG_MODULES=y" >> "$GKI_PATH"
-          
-          sort -u "$GKI_PATH" -o "$GKI_PATH"
-          echo "=== 配置验证完成 ==="
-
+          echo "✅ 所有补丁应用成功"
       - name: 配置ZRAM算法
         if: ${{ github.event.inputs.use_zram == 'true' }}
         run: |
@@ -490,7 +470,6 @@ jobs:
             update_cfg "CONFIG_CRYPTO_LZ4KD" "y"; update_cfg "CONFIG_CRYPTO_842" "y"; update_cfg "CONFIG_CRYPTO_LZ4K_OPLUS" "y"
           fi
           sort -u "$CONFIG_FILE_PATH" -o "$CONFIG_FILE_PATH"
-
       - name: 配置SUSFS功能
         run: |
           set -euo pipefail
@@ -505,7 +484,6 @@ jobs:
           for fp in "${{ env.KERNEL_SRC_ROOT }}/common/build.config.gki" "${{ env.KERNEL_SRC_ROOT }}/common/build.config.gki.aarch64" "${{ env.KERNEL_SRC_ROOT }}/common/build.config"; do
             if [ -f "$fp" ]; then sed -i 's/check_defconfig//g' "$fp"; fi
           done
-
       - name: 生成版本后缀和日期
         id: generate_suffixes
         env:
@@ -538,7 +516,6 @@ jobs:
           fi
           echo "FINAL_KERNEL_LOCAL_VERSION=${final_kernel_local_version}" >> "$GITHUB_ENV"
           echo "final_kernel_local_version_for_release_body=${final_kernel_local_version}" >> $GITHUB_OUTPUT
-
       - name: 配置内核版本参数
         working-directory: ${{ env.KERNEL_SRC_ROOT }}
         run: |
@@ -573,35 +550,6 @@ jobs:
             find ./common/android/ -name "abi_gki_protected_exports_*" -delete
             if [ -f "./build/kernel/kleaf/impl/stamp.bzl" ]; then sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" "./build/kernel/kleaf/impl/stamp.bzl"; fi
           fi
-
-      - name: 准备编译环境
-        working-directory: ${{ env.KERNEL_SRC_ROOT }}
-        run: |
-          set -euo pipefail
-          
-          echo "=== 清理之前的构建 ==="
-          # 安全清理，避免误删重要文件
-          find . -name "*.o" -type f -delete 2>/dev/null || true
-          find . -name "*.cmd" -type f -delete 2>/dev/null || true
-          find . -name ".tmp_versions" -type d -exec rm -rf {} + 2>/dev/null || true
-          
-          echo "=== 检查工具链 ==="
-          if [ -f "./build/build.sh" ]; then
-            echo "使用传统build.sh构建系统"
-          else
-            echo "使用Bazel构建系统"
-            # 确保Bazel配置正确
-            if [ -f "build/kernel/kleaf/BUILD.bazel" ]; then
-              echo "Bazel构建文件存在"
-            fi
-          fi
-          
-          echo "=== 最终配置检查 ==="
-          if [ -f "${{ env.GKI_DEFCONFIG_PATH_ENV }}" ]; then
-            echo "关键配置项:"
-            grep -E "^(CONFIG_KSU|CONFIG_MODULES|CONFIG_ZRAM)=" "${{ env.GKI_DEFCONFIG_PATH_ENV }}" || true
-          fi
-
       - name: 校验关键内核配置
         run: |
           set -euo pipefail
@@ -619,8 +567,7 @@ jobs:
             check_cfg "CONFIG_ZRAM" "y" "true"; check_cfg "CONFIG_CRYPTO_LZ4K" "y" "true"
           fi
           if [ "$CRIT_FAIL" -ne 0 ]; then cat "$GKI_CHECK"; exit 1; fi
-
-      - name: 执行内核编译（增强日志）
+      - name: 执行内核编译
         uses: nick-fields/retry@v3
         env:
           BAZEL_PROFILE_PATH_IN_WORKSPACE: "${{ github.workspace }}/${{ env.BAZEL_PROFILE_FILENAME }}"
@@ -631,45 +578,20 @@ jobs:
           command: |
             set -euo pipefail
             set -x
-            
-            cd "${{ env.KERNEL_SRC_ROOT }}"
-            
-            # 设置更详细的编译日志
-            export KCFLAGS="-Wno-error"
-            
+            BAZEL_WAS_USED="false"
             execute_build_process() {
+              cd "${{ env.KERNEL_SRC_ROOT }}" || exit 1
               B_SCRIPT="./build/build.sh"
               BZL_CACHE="/home/runner/.cache/bazel_disk_cache"
               mkdir -p "$BZL_CACHE"
-              
               if [ -f "$B_SCRIPT" ]; then
-                echo "=== 使用传统构建系统 ==="
-                # 添加V=1获取详细输出
-                LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
-                BUILD_CONFIG=common/build.config.gki.aarch64 CC="/usr/bin/ccache clang" \
-                /usr/bin/time -v ./build/build.sh V=1 2>&1 | tee build_detailed.log
+                LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 BUILD_CONFIG=common/build.config.gki.aarch64 CC="/usr/bin/ccache clang" /usr/bin/time -v ./build/build.sh
               else
-                echo "=== 使用Bazel构建系统 ==="
                 BAZEL_WAS_USED="true"
-                /usr/bin/time -v bash -c \
-                  "tools/bazel build --disk_cache=\"${BZL_CACHE}\" --config=fast --lto=thin \
-                  --profile=\"${BAZEL_PROFILE_PATH_IN_WORKSPACE}\" $BAZEL_OPTIMIZATION_FLAGS \
-                  --verbose_failures //common:kernel_aarch64_dist" 2>&1 | tee build_detailed.log
+                /usr/bin/time -v bash -c "tools/bazel build --disk_cache=\"${BZL_CACHE}\" --config=fast --lto=thin --profile=\"${BAZEL_PROFILE_PATH_IN_WORKSPACE}\" $BAZEL_OPTIMIZATION_FLAGS //common:kernel_aarch64_dist"
               fi
             }
-            
             execute_build_process
-            
-            # 检查构建结果
-            if [ ${PIPESTATUS[0]} -ne 0 ]; then
-              echo "::error::构建失败，检查详细日志"
-              if [ -f "build_detailed.log" ]; then
-                echo "=== 构建日志最后100行 ==="
-                tail -100 build_detailed.log
-              fi
-              exit 1
-            fi
-            
             ccache --show-stats
             if [ -n "${CCACHE_LOGFILE}" ] && [ -f "${CCACHE_LOGFILE}" ]; then
               tail -n 10 "${CCACHE_LOGFILE}" || true
@@ -679,32 +601,6 @@ jobs:
                 echo "::warning::Bazel profile file was expected (Bazel build path taken) but not found at ${BAZEL_PROFILE_PATH_IN_WORKSPACE}."
               fi
             fi
-
-      - name: 收集构建失败信息
-        if: failure()
-        run: |
-          set -euo pipefail
-          cd "${{ env.KERNEL_SRC_ROOT }}"
-          
-          echo "=== 构建失败调试信息 ==="
-          
-          # 检查配置文件
-          if [ -f "${{ env.GKI_DEFCONFIG_PATH_ENV }}" ]; then
-            echo "当前GKI配置:"
-            grep -E "^(CONFIG_|# CONFIG_)" "${{ env.GKI_DEFCONFIG_PATH_ENV }}" | head -20
-          fi
-          
-          # 检查补丁状态
-          if [ -f "build_detailed.log" ]; then
-            echo "错误摘要:"
-            grep -i "error:\|undefined\|conflict\|rejected" build_detailed.log | head -10 || true
-          fi
-          
-          # 检查工具链
-          echo "工具链版本:"
-          clang --version 2>/dev/null || echo "clang未找到"
-          which ccache && ccache --version
-
       - name: KPM修补 (Android 12/13)
         if: env.EFFECTIVE_USE_KPM == 'true' && (env.SELECTED_ANDROID_VERSION == 'android12' || env.SELECTED_ANDROID_VERSION == 'android13') && env.SELECTED_KERNEL_VERSION != '6.6'
         run: |
@@ -717,7 +613,6 @@ jobs:
             chmod +x pk; ./pk
             if [ -f "oImage" ]; then mv Image Image.o; mv oImage Image; fi
           fi
-
       - name: KPM修补 (Android 14/15)
         if: env.EFFECTIVE_USE_KPM == 'true' && (env.SELECTED_ANDROID_VERSION == 'android14' || env.SELECTED_ANDROID_VERSION == 'android15') && env.SELECTED_KERNEL_VERSION != '6.6'
         run: |
@@ -730,7 +625,6 @@ jobs:
             chmod +x pk; ./pk
             if [ -f "oImage" ]; then mv Image Image.o; mv oImage Image; fi
           fi
-
       - name: 复制内核映像到AnyKernel3
         run: |
           set -euo pipefail
@@ -749,7 +643,6 @@ jobs:
           AK3_DIR="$GITHUB_WORKSPACE/AnyKernel3"
           if [ ! -d "$AK3_DIR" ]; then exit 1; fi
           cp "$IMG_SRC" "$AK3_DIR/Image"
-
       - name: 验证内核镜像类型
         run: |
           set -euo pipefail
@@ -759,7 +652,6 @@ jobs:
           if ! (echo "$file_out" | grep -q "ARM64" && echo "$file_out" | grep -q "Linux kernel"); then
             exit 1
           fi
-
       - name: 生成发布信息和文件名
         id: generate_release_info
         shell: bash
@@ -790,14 +682,12 @@ jobs:
           echo "release_tag_name=${_tag}" >> "$GITHUB_OUTPUT"
           echo "release_title_name=${_tit}" >> "$GITHUB_OUTPUT"
           echo "stable_release_tag_for_action=${_stable_group_tag}" >> "$GITHUB_OUTPUT"
-
       - name: 上传内核刷机包 Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.generate_release_info.outputs.artifact_name_for_release }}
           path: ${{ github.workspace }}/AnyKernel3
           if-no-files-found: error
-
       - name: 清理构建空间
         if: always()
         run: |
@@ -805,7 +695,6 @@ jobs:
           if [ -d "/home/runner/.cache/bazel_disk_cache" ]; then rm -rf /home/runner/.cache/bazel_disk_cache || echo "::warning::Bazel disk cache removal failed."; fi
           if [ -d "$HOME/.cache/bazel" ]; then rm -rf "$HOME/.cache/bazel" || echo "::warning::Bazel repo cache removal failed."; fi
           ccache -s
-
       - name: 上传构建日志
         if: always()
         uses: actions/upload-artifact@v4
@@ -814,7 +703,6 @@ jobs:
           path: |
             ${{ env.CCACHE_LOGFILE }}
             ${{ github.workspace }}/${{ env.BAZEL_PROFILE_FILENAME }}
-            ${{ env.KERNEL_SRC_ROOT }}/build_detailed.log
           if-no-files-found: ignore
 
   create_release:
